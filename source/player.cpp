@@ -838,7 +838,7 @@ int32_t Player::getDefaultStats(stats_t stat)
 
 int32_t Player::getStepSpeed() const
 {
-	if(getSpeed() > PLAYER_MAX_SPEED){
+	if(getSpeed() > PLAYER_MAX_SPEED || hasFlag(PlayerFlag_SetMaxSpeed)){
 		return PLAYER_MAX_SPEED;
 	}
 	else if(getSpeed() < PLAYER_MIN_SPEED){
@@ -1978,7 +1978,7 @@ void Player::onThink(uint32_t interval)
 		}
 	}
 
-	if(canLogout() && !hasCondition(CONDITION_INFIGHT) && !client){
+	if(!hasCondition(CONDITION_INFIGHT) && !client && canLogout()){
 		g_game.removeCreature(this, true);
 	}
 
@@ -2691,6 +2691,41 @@ uint32_t Player::getGuildId() const
 		return 0;
 }
 
+bool Player::isGuildEnemy(const Player* player) const
+{
+	if(!player || !player->getGuild() || !getGuild())
+		return false;
+
+	if(getGuild()->isEnemy(player->getGuildId()) != 0)
+		return true;
+
+	return false;
+}
+
+bool Player::isGuildPartner(const Player* player) const
+{
+	if(!player || !player->getGuild() || !getGuild())
+		return false;
+
+	if(getGuildId() == player->getGuildId())
+		return true;
+
+	return false;
+}
+
+bool Player::isWarPartner(const Player* player) const
+{
+	if(!isGuildPartner(player))
+		return false;
+
+	//They belong to the same guild, so let's just check
+	//if such guild is in war
+	if(getGuild()->isAtWar())
+		return true;
+
+	return false;
+}
+
 void Player::notifyLogIn(Player* login_player)
 {
 	if(client){
@@ -2947,7 +2982,7 @@ ReturnValue Player::__queryAdd(int32_t index, const Thing* thing, uint32_t count
 							}
 						}
 					}
-				if(item->getWeaponType() != WEAPON_NONE && ret == RET_NOERROR){
+				if(item->getWeaponType() != WEAPON_DIST && ret == RET_NOERROR){
 					self->setLastAttackAsNow();
 					}
 				}
@@ -2981,25 +3016,33 @@ ReturnValue Player::__queryAdd(int32_t index, const Thing* thing, uint32_t count
 			break;
 	}
 
-	if(ret == RET_BOTHHANDSNEEDTOBEFREE && (index == SLOT_LEFT || index == SLOT_RIGHT)){
-		Item* tmpItem = NULL;
-		Container* tmpContainer = NULL;
-		slots_t setSlot = (slots_t)index;
-		if(inventory[setSlot]){
-			for(int i = SLOT_FIRST; i <= SLOT_LAST; i++){
-				tmpItem = getInventoryItem((slots_t)i);
-				if(tmpItem){
-					tmpContainer = tmpItem->getContainer();
-					if(tmpContainer && (tmpContainer->getItemCount() != tmpContainer->getItemHoldingCount())){
-						self->sendRemoveInventoryItem(setSlot, inventory[setSlot]);
-						self->onRemoveInventoryItem(setSlot, inventory[setSlot]);
-						g_game.internalAddItem(tmpContainer, inventory[setSlot], INDEX_WHEREEVER, FLAG_NOLIMIT);
-						self->inventory[setSlot] = NULL;
-						break;
-					}
-				}
-			}
+	if (ret == RET_BOTHHANDSNEEDTOBEFREE && (index == SLOT_LEFT || index == SLOT_RIGHT)) {
+ 
+		slots_t hands = (slots_t)index;
+		if (!inventory[hands]) {
+			return RET_BOTHHANDSNEEDTOBEFREE;
 		}
+	   
+		Item* tmpItem = const_cast<Item*>(item);
+		Position itemPos = tmpItem->getPosition();
+		Container* container = dynamic_cast<Container*>(tmpItem->getParent());
+		if (container) {
+			if (container->size() >= container->capacity()) {
+				return RET_CONTAINERNOTENOUGHROOM;
+			}
+	 
+			itemPos.x = 65535;
+			itemPos.y = static_cast<uint16_t>(0x40) | static_cast<uint16_t>(getContainerID(container));
+			itemPos.z = __getIndexOfThing(item);
+		}
+	 
+		Cylinder* cylinder = g_game.internalGetCylinder(self, const_cast<Position&>(itemPos));
+		if (!cylinder) {
+			return RET_NOTPOSSIBLE;
+		}
+	 
+		g_game.internalMoveItem(self, cylinder, INDEX_WHEREEVER, inventory[hands], inventory[hands]->getItemCount(), 0);
+		self->inventory[hands] = NULL;
 	}
 
 	if(ret == RET_NOERROR || ret == RET_NOTENOUGHROOM){
@@ -3875,6 +3918,8 @@ void Player::onAttackedCreature(Creature* target)
 
 				#ifdef __SKULLSYSTEM__
 				if( !isPartner(targetPlayer) &&
+					!isWarPartner(targetPlayer) &&
+					!isGuildEnemy(targetPlayer) &&
 					!Combat::isInPvpZone(this, targetPlayer) &&
 					!targetPlayer->hasAttacked(this)){
 
@@ -3987,7 +4032,7 @@ void Player::onKilledCreature(Creature* target, bool lastHit)
 			targetPlayer->setDropLoot(false);
 			targetPlayer->setLossSkill(false);
 		}
-		else if (!isPartner(targetPlayer) ||
+		else if (!isPartner(targetPlayer) || 
 			(g_config.getNumber(ConfigManager::LAST_HIT_PZBLOCK_ONLY) &&
 			lastHit)){
 			if(checkPzBlock(targetPlayer))
@@ -4223,15 +4268,21 @@ Skulls_t Player::getSkullClient(const Player* player) const
 	if(!player){
 		return SKULL_NONE;
 	}
+	
+	if(getSkull() != SKULL_NONE && player->hasAttacked(this) || isGuildEnemy(player)){
+		return SKULL_YELLOW;
+	}	
 
-	if(getSkull() != SKULL_NONE && player->getSkull() != SKULL_RED){
-		if(player->hasAttacked(this)){
+	/* if(player->getSkull() != SKULL_NONE && player->getSkull() != SKULL_RED){
+		if(player->hasAttacked(this) || isGuildEnemy(player)){
 			return SKULL_YELLOW;
 		}
-	}
+	} */
 
-	if (player->getSkull() == SKULL_NONE && isPartner(player) && g_game.getWorldType() != WORLD_TYPE_NO_PVP){
-		return SKULL_GREEN;
+	if (player->getSkull() == SKULL_NONE && g_game.getWorldType() != WORLD_TYPE_NO_PVP){
+		if (isPartner(player) || isWarPartner(player)) {
+			return SKULL_GREEN;
+		}	
 	}
 
 	return player->getSkull();
@@ -4476,6 +4527,12 @@ void Player::checkIdleTime(uint32_t ticks)
 bool Player::checkPzBlock(Player* targetPlayer)
 {
 	if(hasFlag(PlayerFlag_NotGainInFight) || Combat::isInPvpZone(this, targetPlayer))
+		return false;
+
+	if(isGuildEnemy(targetPlayer))
+		return true;
+
+	if(isPartner(targetPlayer) || isWarPartner(targetPlayer))
 		return false;
 
 	#ifdef __SKULLSYSTEM__
